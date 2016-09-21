@@ -3,7 +3,7 @@ package tsm1
 import "sync"
 
 var (
-	bufPool          sync.Pool
+	bufPool          = NewBytesPool(1024)
 	float64ValuePool sync.Pool
 	integerValuePool sync.Pool
 	booleanValuePool sync.Pool
@@ -12,15 +12,7 @@ var (
 
 // getBuf returns a buffer with length size from the buffer pool.
 func getBuf(size int) []byte {
-	x := bufPool.Get()
-	if x == nil {
-		return make([]byte, size)
-	}
-	buf := x.([]byte)
-	if cap(buf) < size {
-		return make([]byte, size)
-	}
-	return buf[:size]
+	return bufPool.Get(size)
 }
 
 // putBuf returns a buffer to the pool.
@@ -143,5 +135,38 @@ func putValue(buf []Value) {
 		case *StringValue:
 			putStringValues(buf)
 		}
+	}
+}
+
+type BytesPool struct {
+	pool chan []byte
+}
+
+func NewBytesPool(max int) *BytesPool {
+	return &BytesPool{
+		pool: make(chan []byte, max),
+	}
+}
+
+func (p *BytesPool) Get(sz int) []byte {
+	var c []byte
+	select {
+	case c = <-p.pool:
+	default:
+		c = make([]byte, sz)
+	}
+
+	if cap(c) < sz {
+		return make([]byte, sz)
+	}
+
+	return c
+}
+
+func (p *BytesPool) Put(c []byte) {
+	select {
+	case p.pool <- c:
+	default:
+		// let it go, let it go...
 	}
 }

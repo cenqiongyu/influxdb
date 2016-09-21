@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/influxdata/influxdb/influxql"
+	"github.com/influxdata/influxdb/pkg/pool"
 	"github.com/influxdata/influxdb/tsdb"
 )
 
@@ -25,6 +26,24 @@ const (
 	// encodedBlockHeaderSize is the size of the header for an encoded block.  There is one
 	// byte encoding the type of the block.
 	encodedBlockHeaderSize = 1
+)
+
+var (
+	timeEncoderPool = pool.NewGeneric(1024, func(sz int) interface{} {
+		return NewTimeEncoder(sz)
+	})
+	integerEncoderPool = pool.NewGeneric(1024, func(sz int) interface{} {
+		return NewIntegerEncoder(sz)
+	})
+	floatEncoderPool = pool.NewGeneric(1024, func(sz int) interface{} {
+		return NewFloatEncoder()
+	})
+	stringEncoderPool = pool.NewGeneric(1024, func(sz int) interface{} {
+		return NewStringEncoder(sz)
+	})
+	booleanEncoderPool = pool.NewGeneric(1024, func(sz int) interface{} {
+		return NewBooleanEncoder(sz)
+	})
 )
 
 type Value interface {
@@ -220,11 +239,13 @@ func encodeFloatBlock(buf []byte, values []Value) ([]byte, error) {
 	// for timestamps and values.
 
 	// Encode values using Gorilla float compression
-	venc := NewFloatEncoder()
+	venc := getFloatEncoder()
+	defer putFloatEncoder(venc)
 
 	// Encode timestamps using an adaptive encoder that uses delta-encoding,
 	// frame-or-reference and run length encoding.
-	tsenc := NewTimeEncoder()
+	tsenc := getTimeEncoder(len(values))
+	defer putTimeEncoder(tsenc)
 
 	for _, v := range values {
 		tsenc.Write(v.UnixNano())
@@ -245,9 +266,7 @@ func encodeFloatBlock(buf []byte, values []Value) ([]byte, error) {
 
 	// Prepend the first timestamp of the block in the first 8 bytes and the block
 	// in the next byte, followed by the block
-	block := packBlockHeader(BlockFloat64)
-	block = append(block, packBlock(tb, vb)...)
-	return block, nil
+	return packBlock(buf, BlockFloat64, tb, vb), nil
 }
 
 func DecodeFloatBlock(block []byte, tdec *TimeDecoder, vdec *FloatDecoder, a *[]FloatValue) ([]FloatValue, error) {
@@ -324,12 +343,12 @@ func encodeBooleanBlock(buf []byte, values []Value) ([]byte, error) {
 
 	// A boolean block is encoded using different compression strategies
 	// for timestamps and values.
-
-	// Encode values using Gorilla float compression
-	venc := NewBooleanEncoder()
+	venc := getBooleanEncoder(len(values))
+	defer putBooleanEncoder(venc)
 
 	// Encode timestamps using an adaptive encoder
-	tsenc := NewTimeEncoder()
+	tsenc := getTimeEncoder(len(values))
+	defer putTimeEncoder(tsenc)
 
 	for _, v := range values {
 		tsenc.Write(v.UnixNano())
@@ -349,9 +368,7 @@ func encodeBooleanBlock(buf []byte, values []Value) ([]byte, error) {
 
 	// Prepend the first timestamp of the block in the first 8 bytes and the block
 	// in the next byte, followed by the block
-	block := packBlockHeader(BlockBoolean)
-	block = append(block, packBlock(tb, vb)...)
-	return block, nil
+	return packBlock(buf, BlockBoolean, tb, vb), nil
 }
 
 func DecodeBooleanBlock(block []byte, tdec *TimeDecoder, vdec *BooleanDecoder, a *[]BooleanValue) ([]BooleanValue, error) {
@@ -420,8 +437,10 @@ func (f *IntegerValue) String() string {
 }
 
 func encodeIntegerBlock(buf []byte, values []Value) ([]byte, error) {
-	tsEnc := NewTimeEncoder()
-	vEnc := NewIntegerEncoder()
+	tsEnc := getTimeEncoder(len(values))
+	defer putTimeEncoder(tsEnc)
+	vEnc := getIntegerEncoder(len(values))
+	defer putIntegerEncoder(vEnc)
 	for _, v := range values {
 		tsEnc.Write(v.UnixNano())
 		vEnc.Write(v.(*IntegerValue).value)
@@ -439,8 +458,7 @@ func encodeIntegerBlock(buf []byte, values []Value) ([]byte, error) {
 	}
 
 	// Prepend the first timestamp of the block in the first 8 bytes
-	block := packBlockHeader(BlockInteger)
-	return append(block, packBlock(tb, vb)...), nil
+	return packBlock(buf, BlockInteger, tb, vb), nil
 }
 
 func DecodeIntegerBlock(block []byte, tdec *TimeDecoder, vdec *IntegerDecoder, a *[]IntegerValue) ([]IntegerValue, error) {
@@ -510,8 +528,11 @@ func (f *StringValue) String() string {
 }
 
 func encodeStringBlock(buf []byte, values []Value) ([]byte, error) {
-	tsEnc := NewTimeEncoder()
-	vEnc := NewStringEncoder()
+	tsEnc := getTimeEncoder(len(values))
+	defer putTimeEncoder(tsEnc)
+	vEnc := getStringEncoder(len(values) * len(values[0].(*StringValue).value))
+	defer putStringEncoder(vEnc)
+
 	for _, v := range values {
 		tsEnc.Write(v.UnixNano())
 		vEnc.Write(v.(*StringValue).value)
@@ -529,8 +550,7 @@ func encodeStringBlock(buf []byte, values []Value) ([]byte, error) {
 	}
 
 	// Prepend the first timestamp of the block in the first 8 bytes
-	block := packBlockHeader(BlockString)
-	return append(block, packBlock(tb, vb)...), nil
+	return packBlock(buf, BlockString, tb, vb), nil
 }
 
 func DecodeStringBlock(block []byte, tdec *TimeDecoder, vdec *StringDecoder, a *[]StringValue) ([]StringValue, error) {
@@ -580,22 +600,23 @@ func DecodeStringBlock(block []byte, tdec *TimeDecoder, vdec *StringDecoder, a *
 	return (*a)[:i], nil
 }
 
-func packBlockHeader(blockType byte) []byte {
-	return []byte{blockType}
-}
-
-func packBlock(ts []byte, values []byte) []byte {
+func packBlock(buf []byte, typ byte, ts []byte, values []byte) []byte {
 	// We encode the length of the timestamp block using a variable byte encoding.
 	// This allows small byte slices to take up 1 byte while larger ones use 2 or more.
-	b := make([]byte, 10)
-	i := binary.PutUvarint(b, uint64(len(ts)))
+	if len(buf) < 1+10+len(ts)+len(values) {
+		buf = make([]byte, 1+10+len(ts)+len(values))
+	}
+	b := buf
+	b[0] = typ
+	i := binary.PutUvarint(b[1:10], uint64(len(ts)))
+	i += 1
 
 	// block is <len timestamp bytes>, <ts bytes>, <value bytes>
-	block := append(b[:i], ts...)
-
+	copy(b[i:], ts)
 	// We don't encode the value length because we know it's the rest of the block after
 	// the timestamp block.
-	return append(block, values...)
+	copy(b[i+len(ts):], values)
+	return b[:i+len(ts)+len(values)]
 }
 
 func unpackBlock(buf []byte) (ts, values []byte, err error) {
@@ -629,3 +650,37 @@ func ZigZagEncode(x int64) uint64 {
 func ZigZagDecode(v uint64) int64 {
 	return int64((v >> 1) ^ uint64((int64(v&1)<<63)>>63))
 }
+func getTimeEncoder(sz int) TimeEncoder {
+	x := timeEncoderPool.Get(sz).(TimeEncoder)
+	x.Reset()
+	return x
+}
+func putTimeEncoder(enc TimeEncoder) { timeEncoderPool.Put(enc) }
+
+func getIntegerEncoder(sz int) IntegerEncoder {
+	x := integerEncoderPool.Get(sz).(IntegerEncoder)
+	x.Reset()
+	return x
+}
+func putIntegerEncoder(enc IntegerEncoder) { integerEncoderPool.Put(enc) }
+
+func getFloatEncoder() *FloatEncoder {
+	x := floatEncoderPool.Get(1024).(*FloatEncoder)
+	x.Reset()
+	return x
+}
+func putFloatEncoder(enc *FloatEncoder) { floatEncoderPool.Put(enc) }
+
+func getStringEncoder(sz int) StringEncoder {
+	x := stringEncoderPool.Get(sz).(StringEncoder)
+	x.Reset()
+	return x
+}
+func putStringEncoder(enc StringEncoder) { stringEncoderPool.Put(enc) }
+
+func getBooleanEncoder(sz int) BooleanEncoder {
+	x := booleanEncoderPool.Get(sz).(BooleanEncoder)
+	x.Reset()
+	return x
+}
+func putBooleanEncoder(enc BooleanEncoder) { booleanEncoderPool.Put(enc) }
